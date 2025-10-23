@@ -1,4 +1,4 @@
 mutagen>=1.47.0
-faster-whisper>=1.0.3
-openai-whisper>=20231117
-ctranlate2>=4.4.0; python_version>='3.8'  # optional for faster-whisper prebuilt models
+faster-whisper>=1.2.0
+openai-whisper>=20250625
+ctranslate2>=4.6.0; python_version>='3.9'  # 4.6.0 drops 3.8
