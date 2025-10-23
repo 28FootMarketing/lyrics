@@ -1,89 +1,48 @@
-"""
-Lyrics Extractor
-1) Reads embedded lyrics from audio file tags when available.
-2) Falls back to speech-to-text transcription using Faster-Whisper or OpenAI Whisper.
-Outputs .txt by default. Can produce .lrc if timestamps exist or when transcribing with word timestamps.
-
-Supported containers:
-- MP3 (ID3: USLT unsynchronized, SYLT synchronized)
-- M4A/MP4 (©lyr atom, ilst keys)
-- FLAC/OGG (Vorbis comments: LYRICS, UNSYNCEDLYRICS, or custom fields)
-
-Usage:
-    python lyrics_extractor.py "path/to/song.mp3" --output-dir ./out --prefer lrc --model small
-
-Install:
-    pip install -r requirements.txt
-    Ensure ffmpeg is available in PATH for transcription.
-"""
-
-import argparse
-import sys
+import io
 import os
 from pathlib import Path
-from typing import Optional, Tuple, List, Iterable, Dict
+from typing import Optional, Tuple, List, Dict
 
-# Tag readers
+import streamlit as st
 from mutagen import File as MutagenFile
 from mutagen.id3 import USLT, SYLT, ID3
 from mutagen.mp4 import MP4
 from mutagen.flac import FLAC
+
+# Optional for .ogg detection
 try:
-    from mutagen.oggvorbis import OggVorbis
+    from mutagen.oggvorbis import OggVorbis  # noqa: F401
 except Exception:
-    OggVorbis = None  # optional
+    OggVorbis = None  # best effort
 
 # --------------------------
-# Optional STT backends
+# Helpers
 # --------------------------
-def _import_stt_backends():
-    fw = None
-    ow = None
-    try:
-        from faster_whisper import WhisperModel  # type: ignore
-        fw = WhisperModel
-    except Exception:
-        pass
-    try:
-        import whisper  # type: ignore
-        ow = whisper
-    except Exception:
-        pass
-    return fw, ow
+def _format_ts(t: float) -> str:
+    m = int(t // 60)
+    s = int(t % 60)
+    cs = int(round((t - int(t)) * 100))
+    return f"[{m:02d}:{s:02d}.{cs:02d}]"
 
-# --------------------------
-# Tag extraction helpers
-# --------------------------
-def _first_nonempty(values: Iterable[Optional[str]]) -> Optional[str]:
-    for v in values:
-        if v:
-            s = str(v).strip()
-            if s:
-                return s
-    return None
-
-def _read_id3_lyrics(input_path: Path) -> Tuple[Optional[str], Optional[List[Tuple[float, str]]]]:
+def _read_id3_lyrics(tmp_path: Path) -> Tuple[Optional[str], Optional[List[Tuple[float, str]]]]:
     try:
-        id3 = ID3(str(input_path))
+        id3 = ID3(str(tmp_path))
     except Exception:
         return None, None
 
-    # Prefer unsynced USLT first
-    unsynced_candidates = []
+    unsynced = None
+    uns = []
     for frame in id3.getall("USLT"):
         if isinstance(frame, USLT) and frame.text:
-            # Collect by length to choose the most complete if multiple frames exist
-            unsynced_candidates.append(str(frame.text).strip())
-    unsynced = max(unsynced_candidates, key=len) if unsynced_candidates else None
+            uns.append(str(frame.text).strip())
+    if uns:
+        unsynced = max(uns, key=len)
 
-    # Then check synchronized SYLT
     synced: List[Tuple[float, str]] = []
     for frame in id3.getall("SYLT"):
         if not isinstance(frame, SYLT) or not frame.text:
             continue
-        # Mutagen SYLT.text can be a list of tuples [(timestamp_ms, text)] or [(text, timestamp_ms)]
-        # Try both orders defensively
-        local_synced: List[Tuple[float, str]] = []
+        local = []
         try:
             for item in frame.text:
                 if isinstance(item, (list, tuple)) and len(item) >= 2:
@@ -93,39 +52,34 @@ def _read_id3_lyrics(input_path: Path) -> Tuple[Optional[str], Optional[List[Tup
                     elif isinstance(b, int) and not isinstance(a, int):
                         t_ms, line = b, str(a)
                     else:
-                        # Fallback skip if unreadable
                         continue
-                    local_synced.append((max(t_ms, 0) / 1000.0, line.strip()))
+                    local.append((max(t_ms, 0) / 1000.0, line.strip()))
         except Exception:
-            local_synced = []
-        if local_synced:
-            synced.extend(local_synced)
+            local = []
+        if local:
+            synced.extend(local)
 
-    return unsynced if unsynced else None, (synced if synced else None)
+    return (unsynced or None), (synced or None)
 
-def _read_mp4_lyrics(input_path: Path) -> Tuple[Optional[str], Optional[List[Tuple[float, str]]]]:
+def _read_mp4_lyrics(tmp_path: Path) -> Tuple[Optional[str], Optional[List[Tuple[float, str]]]]:
     try:
-        mp4 = MP4(str(input_path))
+        mp4 = MP4(str(tmp_path))
         tags = mp4.tags or {}
     except Exception:
         return None, None
-
-    # Normalize MP4 atoms to strings; common: '\xa9lyr'
-    keys = ["\xa9lyr", "lyrics", "LYRICS"]
-    for k in keys:
-        if k in tags and tags[k]:
-            val = tags[k]
+    for key in ["\xa9lyr", "lyrics", "LYRICS"]:
+        if key in tags and tags[key]:
+            val = tags[key]
             if isinstance(val, list):
                 val = val[0]
             return str(val), None
     return None, None
 
-def _read_flac_lyrics(input_path: Path) -> Tuple[Optional[str], Optional[List[Tuple[float, str]]]]:
+def _read_flac_lyrics(tmp_path: Path) -> Tuple[Optional[str], Optional[List[Tuple[float, str]]]]:
     try:
-        flac = FLAC(str(input_path))
+        flac = FLAC(str(tmp_path))
     except Exception:
         return None, None
-    # Vorbis comments are case-insensitive; use get() to avoid KeyError
     for key in ("LYRICS", "UNSYNCEDLYRICS", "Lyrics", "lyrics"):
         vals = flac.tags.get(key, [])
         if vals:
@@ -136,7 +90,6 @@ def _read_vorbis_like(audio) -> Tuple[Optional[str], Optional[List[Tuple[float, 
     tags = getattr(audio, "tags", None)
     if not tags:
         return None, None
-    # Normalize keys to upper for lookup
     upper_map: Dict[str, List[str]] = {}
     try:
         for k in tags.keys():
@@ -148,48 +101,27 @@ def _read_vorbis_like(audio) -> Tuple[Optional[str], Optional[List[Tuple[float, 
             upper_map[str(k).upper()].extend([str(x) for x in vals])
     except Exception:
         return None, None
-
     for key in ("LYRICS", "UNSYNCEDLYRICS"):
         vals = upper_map.get(key, [])
         if vals:
             return "\n".join(vals), None
     return None, None
 
-def read_embedded_lyrics(input_path: Path) -> Tuple[Optional[str], Optional[List[Tuple[float, str]]]]:
-    """Return (unsynced_text, synced_list). synced_list is [(time_seconds, line)]."""
-    audio = MutagenFile(input_path)
+def read_embedded_lyrics(tmp_path: Path) -> Tuple[Optional[str], Optional[List[Tuple[float, str]]]]:
+    audio = MutagenFile(tmp_path)
     if audio is None:
         return None, None
-
-    suf = input_path.suffix.lower()
+    suf = tmp_path.suffix.lower()
     if suf == ".mp3":
-        return _read_id3_lyrics(input_path)
+        return _read_id3_lyrics(tmp_path)
     if suf in {".m4a", ".mp4"}:
-        return _read_mp4_lyrics(input_path)
+        return _read_mp4_lyrics(tmp_path)
     if suf == ".flac":
-        return _read_flac_lyrics(input_path)
-    if suf == ".ogg" and OggVorbis is not None:
-        # OGG Vorbis typically uses Vorbis comments
-        return _read_vorbis_like(audio)
-
-    # Generic Vorbis-style tags if present
+        return _read_flac_lyrics(tmp_path)
     return _read_vorbis_like(audio)
 
-# --------------------------
-# Formatting
-# --------------------------
-def _format_ts(t: float) -> str:
-    m = int(t // 60)
-    s = int(t % 60)
-    cs = int(round((t - int(t)) * 100))
-    return f"[{m:02d}:{s:02d}.{cs:02d}]"
-
-def format_lrc_from_synced(
-    synced: List[Tuple[float, str]],
-    title: Optional[str] = None,
-    artist: Optional[str] = None,
-) -> str:
-    lines: List[str] = []
+def format_lrc_from_synced(synced: List[Tuple[float, str]], title: Optional[str], artist: Optional[str]) -> str:
+    lines = []
     if artist:
         lines.append(f"[ar:{artist}]")
     if title:
@@ -199,69 +131,37 @@ def format_lrc_from_synced(
             lines.append(f"{_format_ts(max(t, 0.0))}{text.strip()}")
     return "\n".join(lines)
 
-def write_output(
-    base_out: Path,
-    unsynced: Optional[str],
-    synced: Optional[List[Tuple[float, str]]],
-    prefer: str,
-    title: Optional[str] = None,
-    artist: Optional[str] = None,
-) -> Path:
-    """Write .txt or .lrc depending on data and preference."""
-    if synced and prefer == "lrc":
-        out_path = base_out.with_suffix(".lrc")
-        out_path.write_text(format_lrc_from_synced(synced, title, artist), encoding="utf-8")
-        return out_path
-
-    out_path = base_out.with_suffix(".txt")
-    text = unsynced or ("\n".join([line for _, line in synced]) if synced else "")
-    out_path.write_text(text, encoding="utf-8")
-    return out_path
-
 # --------------------------
 # STT backends
 # --------------------------
-def transcribe_with_faster_whisper(
-    model_name: str,
-    input_path: Path,
-    language: Optional[str],
-    lrc: bool,
-    compute_type: str,
-) -> Tuple[str, Optional[str]]:
-    from faster_whisper import WhisperModel  # type: ignore
-    # compute_type examples: "auto", "int8", "int8_float16", "float16"
+def transcribe_faster_whisper(model_name: str, wav_path: Path, language: Optional[str], want_lrc: bool, compute_type: str):
+    from faster_whisper import WhisperModel
     model = WhisperModel(model_name, compute_type=compute_type or "auto")
     segments, info = model.transcribe(
-        str(input_path),
+        str(wav_path),
         language=language,
         vad_filter=True,
         word_timestamps=True,
     )
-    txt_lines: List[str] = []
-    lrc_lines: List[str] = []
+    txt_lines, lrc_lines = [], []
     for seg in segments:
         line = (seg.text or "").strip()
         if not line:
             continue
         txt_lines.append(line)
-        if lrc:
+        if want_lrc:
             t = float(seg.start or 0.0)
             lrc_lines.append(f"{_format_ts(t)}{line}")
-    return "\n".join(txt_lines), ("\n".join(lrc_lines) if lrc else None)
+    return "\n".join(txt_lines), ("\n".join(lrc_lines) if want_lrc else None)
 
-def transcribe_with_openai_whisper(
-    model_name: str,
-    input_path: Path,
-    language: Optional[str],
-    lrc: bool,
-) -> Tuple[str, Optional[str]]:
-    import whisper  # type: ignore
+def transcribe_openai_whisper(model_name: str, wav_path: Path, language: Optional[str], want_lrc: bool):
+    import whisper
     model = whisper.load_model(model_name)
-    result = model.transcribe(str(input_path), language=language, word_timestamps=True, verbose=False)
+    result = model.transcribe(str(wav_path), language=language, word_timestamps=True, verbose=False)
     txt = (result.get("text") or "").strip()
-    if not lrc:
+    if not want_lrc:
         return txt, None
-    lrc_lines: List[str] = []
+    lrc_lines = []
     for seg in result.get("segments", []):
         line = (seg.get("text") or "").strip()
         t = float(seg.get("start", 0.0))
@@ -269,86 +169,142 @@ def transcribe_with_openai_whisper(
             lrc_lines.append(f"{_format_ts(t)}{line}")
     return txt, ("\n".join(lrc_lines) if lrc_lines else None)
 
-# --------------------------
-# CLI
-# --------------------------
-def ensure_out_dir(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-def main():
-    ap = argparse.ArgumentParser(description="Extract embedded lyrics or transcribe audio to lyrics.")
-    ap.add_argument("input", help="Path to audio file")
-    ap.add_argument("--output-dir", default="./lyrics_out", help="Directory for outputs")
-    ap.add_argument("--prefer", choices=["txt", "lrc"], default="txt", help="Preferred output when synced data is available or during transcription")
-    ap.add_argument("--force-transcribe", action="store_true", help="Skip tag extraction and transcribe directly")
-    ap.add_argument("--model", default="small", help="Whisper model name. Examples: tiny, base, small, medium, large-v2, or CTranslate2 names like 'small'")
-    ap.add_argument("--language", default=None, help="Language code. Example: en")
-    ap.add_argument("--backend", choices=["auto", "faster-whisper", "openai-whisper"], default="auto", help="Choose STT backend when both are installed")
-    ap.add_argument("--compute-type", default="auto", help="Faster-Whisper compute type. Example: auto, int8, int8_float16, float16")
-    ap.add_argument("--title", default=None, help="Optional title for LRC headers")
-    ap.add_argument("--artist", default=None, help="Optional artist for LRC headers")
-    args = ap.parse_args()
-
-    input_path = Path(args.input).expanduser().resolve()
-    if not input_path.exists():
-        print(f"File not found: {input_path}", file=sys.stderr)
-        sys.exit(1)
-
-    out_dir = ensure_out_dir(Path(args.output_dir))
-    base_out = out_dir / input_path.stem
-
-    # Try tags first unless forced
-    unsynced, synced = (None, None)
-    if not args.force_transcribe:
-        if input_path.suffix.lower() == ".mp3":
-            unsynced, synced = _read_id3_lyrics(input_path)
-        elif input_path.suffix.lower() in {".m4a", ".mp4"}:
-            unsynced, synced = _read_mp4_lyrics(input_path)
-        elif input_path.suffix.lower() == ".flac":
-            unsynced, synced = _read_flac_lyrics(input_path)
-        else:
-            audio = MutagenFile(input_path)
-            if audio is not None:
-                unsynced, synced = _read_vorbis_like(audio)
-
-    if unsynced or synced:
-        out_file = write_output(base_out, unsynced, synced, prefer=args.prefer, title=args.title, artist=args.artist)
-        print(f"Extracted embedded lyrics -> {out_file}")
-        sys.exit(0)
-
-    # Transcription path
-    fw, ow = _import_stt_backends()
-    backend = args.backend
-    if backend == "auto":
-        backend = "faster-whisper" if fw is not None else ("openai-whisper" if ow is not None else "none")
-
-    if backend == "none":
-        print("No STT backend found. Install Faster-Whisper or OpenAI Whisper. See README.md", file=sys.stderr)
-        sys.exit(2)
-
-    lrc_needed = args.prefer == "lrc"
+def convert_to_wav(bytes_in: bytes, tmp_out: Path) -> Path:
+    # Whisper prefers standard PCM WAV for stability across formats
+    import subprocess, tempfile
+    with tempfile.NamedTemporaryFile(delete=False) as f_in:
+        f_in.write(bytes_in)
+        in_path = Path(f_in.name)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(in_path),
+        "-ac", "1",
+        "-ar", "16000",
+        str(tmp_out),
+    ]
+    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
     try:
-        if backend == "faster-whisper":
-            if fw is None:
-                raise RuntimeError("Faster-Whisper not installed")
-            txt_content, lrc_content = transcribe_with_faster_whisper(args.model, input_path, args.language, lrc_needed, args.compute_type)
+        in_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return tmp_out
+
+# --------------------------
+# UI
+# --------------------------
+st.set_page_config(page_title="Lyrics Extractor", page_icon="🎵")
+
+st.title("Lyrics Extractor")
+st.write("Upload an audio file. The app will pull embedded lyrics if present. If not, it can transcribe.")
+
+with st.sidebar:
+    st.subheader("Transcription Settings")
+    backend = st.selectbox("Backend", ["Auto", "Faster-Whisper", "OpenAI Whisper"])
+    model_name = st.text_input("Model", value="small")
+    language = st.text_input("Language code", value="", help="Example: en, es, fr. Leave blank to auto-detect.")
+    prefer_format = st.selectbox("Preferred Output", ["txt", "lrc"])
+    compute_type = st.text_input("Faster-Whisper compute_type", value="auto", help="auto, int8, int8_float16, float16")
+    title_tag = st.text_input("LRC Title (optional)", value="")
+    artist_tag = st.text_input("LRC Artist (optional)", value="")
+    force_transcribe = st.checkbox("Force transcription", value=False)
+
+uploaded = st.file_uploader(
+    "Choose an audio file",
+    type=["mp3", "m4a", "mp4", "flac", "ogg", "wav", "aac"],
+)
+
+run = st.button("Process")
+
+if run:
+    if not uploaded:
+        st.error("Please upload an audio file first.")
+        st.stop()
+
+    # Persist to tmp so Mutagen can read tags safely
+    suffix = Path(uploaded.name).suffix.lower() or ".bin"
+    tmp_path = Path(st.experimental_user().get("tmp_dir", ".")) / f"upload{suffix}"
+    tmp_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp_path, "wb") as f:
+        f.write(uploaded.read())
+
+    # Step 1. Try embedded tags unless user forces transcription
+    unsynced, synced = (None, None)
+    if not force_transcribe:
+        with st.status("Reading embedded tags...", expanded=False):
+            unsynced, synced = read_embedded_lyrics(tmp_path)
+
+    # Step 2. If found, output immediately
+    if (unsynced or synced) and not force_transcribe:
+        st.success("Embedded lyrics found.")
+        base_name = Path(uploaded.name).stem
+        if prefer_format == "lrc" and synced:
+            lrc_text = format_lrc_from_synced(synced, title_tag or None, artist_tag or None)
+            st.code(lrc_text, language="text")
+            st.download_button("Download .lrc", data=lrc_text, file_name=f"{base_name}.lrc", mime="text/plain")
         else:
-            if ow is None:
-                raise RuntimeError("OpenAI Whisper not installed")
-            txt_content, lrc_content = transcribe_with_openai_whisper(args.model, input_path, args.language, lrc_needed)
+            txt_text = unsynced if unsynced else "\n".join([line for _, line in synced])
+            st.code(txt_text, language="text")
+            st.download_button("Download .txt", data=txt_text, file_name=f"{base_name}.txt", mime="text/plain")
+        st.stop()
+
+    # Step 3. Transcription path
+    st.info("No embedded lyrics found or transcription forced. Starting transcription...")
+    # Convert any format to wav 16k mono for stable inference
+    try:
+        wav_tmp = convert_to_wav(tmp_path.read_bytes(), tmp_path.with_suffix(".wav"))
     except Exception as e:
-        print(f"Transcription failed: {e}", file=sys.stderr)
-        sys.exit(3)
+        st.error(f"ffmpeg conversion failed. Ensure ffmpeg is installed. Details: {e}")
+        st.stop()
 
-    # Write files
-    txt_path = base_out.with_suffix(".txt")
-    txt_path.write_text(txt_content or "", encoding="utf-8")
-    print(f"Transcription -> {txt_path}")
-    if lrc_content:
-        lrc_path = base_out.with_suffix(".lrc")
-        lrc_path.write_text(lrc_content, encoding="utf-8")
-        print(f"LRC -> {lrc_path}")
+    want_lrc = prefer_format == "lrc"
+    lang = language or None
 
-if __name__ == "__main__":
-    main()
+    # Lazy import to avoid heavy startup
+    fw_available = False
+    ow_available = False
+    try:
+        from faster_whisper import WhisperModel  # noqa: F401
+        fw_available = True
+    except Exception:
+        pass
+    try:
+        import whisper  # noqa: F401
+        ow_available = True
+    except Exception:
+        pass
+
+    chosen = backend
+    if chosen == "Auto":
+        chosen = "Faster-Whisper" if fw_available else ("OpenAI Whisper" if ow_available else "None")
+
+    if chosen == "None" or (chosen == "Faster-Whisper" and not fw_available) or (chosen == "OpenAI Whisper" and not ow_available):
+        st.error("No valid STT backend available. Install Faster-Whisper or OpenAI Whisper.")
+        st.stop()
+
+    try:
+        with st.status("Transcribing...", expanded=False):
+            if chosen == "Faster-Whisper":
+                txt_text, lrc_text = transcribe_faster_whisper(model_name, wav_tmp, lang, want_lrc, compute_type)
+            else:
+                txt_text, lrc_text = transcribe_openai_whisper(model_name, wav_tmp, lang, want_lrc)
+    except Exception as e:
+        st.error(f"Transcription failed. Details: {e}")
+        st.stop()
+
+    base_name = Path(uploaded.name).stem
+    st.success("Done.")
+
+    if want_lrc and lrc_text:
+        # Re-add optional headers
+        if title_tag or artist_tag:
+            header = []
+            if artist_tag:
+                header.append(f"[ar:{artist_tag}]")
+            if title_tag:
+                header.append(f"[ti:{title_tag}]")
+            lrc_text = "\n".join(header + [lrc_text])
+        st.code(lrc_text, language="text")
+        st.download_button("Download .lrc", data=lrc_text, file_name=f"{base_name}.lrc", mime="text/plain")
+
+    st.code(txt_text, language="text")
+    st.download_button("Download .txt", data=txt_text, file_name=f"{base_name}.txt", mime="text/plain")
